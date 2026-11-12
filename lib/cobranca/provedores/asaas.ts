@@ -69,6 +69,29 @@ function baseDeLoopback(base: string): boolean {
   return (u.protocol === "http:" || u.protocol === "https:") && HOSTS_DE_LOOPBACK.has(u.hostname);
 }
 
+/**
+ * O callback do Asaas para a volta, ou `null` quando o endereço não serve: a
+ * volta automática é conforto, e sem ela a fatura sai igual (ver iniciarAssinatura).
+ */
+function callbackDaVolta(urlDeVolta: string, contraDuble: boolean): { successUrl: string; autoRedirect: true } | null {
+  if (!URL.canParse(urlDeVolta)) return null;
+  const retorno = new URL(urlDeVolta);
+  // http só em loopback contra o dublê do e2e (`baseUrl` só existe lá).
+  const protocoloOk = retorno.protocol === "https:" || (contraDuble && baseDeLoopback(urlDeVolta));
+  if (!protocoloOk || retorno.username || retorno.password || retorno.hash) return null;
+  retorno.searchParams.set("voltou", "1");
+  return { successUrl: retorno.toString(), autoRedirect: true };
+}
+
+/**
+ * 4xx que não é chave inválida nem espera: o Asaas recusou antes de processar.
+ * ponytail: o status e o `code` da recusa por domínio não foram medidos; por isso
+ * vale qualquer 4xx assim — refazer sem callback uma recusa de outra causa só a repete.
+ */
+function recusaSemEfeito(e: unknown): e is ErroDoProvedor {
+  return e instanceof ErroDoProvedor && e.status !== null && e.status >= 400 && e.status < 500 && e.status !== 401 && !e.transitorio;
+}
+
 const corpoDeErro = z.object({ errors: z.array(z.object({ code: z.string().optional() })) });
 
 /** Status HTTP + `code` do Asaas → `ErroDoProvedor`. Nunca a `description`. */
@@ -218,8 +241,8 @@ const eventoDoAsaas = z.object({
   // Tetos de tamanho: com o token vazado, cada aviso válido vira uma linha no arquivo de avisos.
   id: z.string().min(1).max(100),
   event: z.string().regex(/^[A-Z_]{1,64}$/),
-  payment: z.object({ customer: z.string().nullish() }).nullish(),
-  subscription: z.object({ customer: z.string().nullish() }).nullish(),
+  payment: z.object({ customer: z.string().max(100).nullish() }).nullish(),
+  subscription: z.object({ customer: z.string().max(100).nullish() }).nullish(),
 });
 
 /**
@@ -480,19 +503,26 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
   /**
    * Releitura antes de criar (sem chave de idempotência): uma assinatura ACTIVE
    * do cliente é a de um POST anterior que processou e perdeu a resposta.
-   * `urlDeVolta` e `chaveIdempotencia` não se aplicam: a fatura do Asaas não
-   * expira nem devolve o cliente — a volta é o "Já paguei", que relê.
+   * A fatura não expira. O callback só navega à ponte própria; a confirmação
+   * continua sendo a releitura autenticada, nunca a chegada à URL.
+   *
+   * O callback é MELHOR ESFORÇO: o Asaas exige que o `successUrl` seja do
+   * domínio cadastrado na conta, e a conta que não cadastrou recusa a criação
+   * inteira. Sem ele a fatura sai igual e o "Já paguei" relê o estado — então
+   * endereço que não serve (não-https, com credencial ou fragmento) segue sem
+   * callback, e a recusa 4xx do POST com callback é refeita UMA vez sem ele
+   * (4xx não processou nada; a releitura de ACTIVE acima já cobre o retry).
    */
   async function iniciarAssinatura(
     p: Parameters<AdaptadorDeCobranca["iniciarAssinatura"]>[0],
   ): ReturnType<AdaptadorDeCobranca["iniciarAssinatura"]> {
+    let callback = callbackDaVolta(p.urlDeVolta, dep.baseUrl !== undefined);
     const orgId = uuidDaOrg(p.orgId);
     const caminho = `/subscriptions?customer=${encodeURIComponent(p.clienteRef)}&status=ACTIVE&limit=10`;
     const ativas = ler(listaDoAsaas(comId), await chamar("GET", caminho)).data.filter((s) => s.deleted !== true);
     const hoje = dataCivilEmSaoPaulo(agora());
     const fimDoTeste = p.trialAte === null ? null : dataCivilEmSaoPaulo(p.trialAte);
-    const assinaturaRef =
-      ativas[0]?.id ??
+    const criar = async () =>
       ler(
         comId,
         await chamar("POST", "/subscriptions", {
@@ -502,17 +532,68 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
           value: p.plano.precoCents / 100,
           cycle: CICLO_DO_INTERVALO[p.plano.intervalo],
           nextDueDate: fimDoTeste !== null && fimDoTeste > hoje ? fimDoTeste : hoje,
+          ...(callback ? { callback } : {}),
           description: p.plano.nome,
           externalReference: orgId,
         }),
       ).id;
+    let assinaturaRef = ativas[0]?.id;
+    if (assinaturaRef === undefined) {
+      try {
+        assinaturaRef = await criar();
+      } catch (e) {
+        if (!(callback && recusaSemEfeito(e))) throw e;
+        logger.warn("cobranca.asaas.callback_nao_aplicado", { status: e.status, codigo: e.codigo, ponto: "assinatura" });
+        callback = null;
+        assinaturaRef = await criar();
+      }
+    }
     const primeira = (await cobrancasDaAssinatura(assinaturaRef)).find((c) => c.status === "PENDING" || c.status === "OVERDUE");
     if (primeira === undefined) throw new ErroDoProvedor(null, "cobranca_ainda_nao_gerada", true);
     const url = linkSeguro(primeira.invoiceUrl);
     if (url === null) throw new ErroDoProvedor(200, "resposta_invalida", false);
+    // Também cobre a primeira fatura de uma assinatura recuperada após retry.
+    // PUT idempotente altera só navegação; não cria cobrança nem marca pagamento.
+    // Falhar aqui não derruba um link válido: a fatura já existe.
+    if (callback) {
+      try {
+        await chamar("PUT", `/payments/${encodeURIComponent(primeira.id)}`, { callback });
+      } catch (e) {
+        if (!(e instanceof ErroDoProvedor)) throw e;
+        logger.warn("cobranca.asaas.callback_nao_aplicado", { status: e.status, codigo: e.codigo, ponto: "fatura" });
+      }
+    }
     // A cobrança é a "sessão" do Asaas: é a id que a troca de plano expira no
     // provedor (#2609) — guardada junto com o link em `checkout_sessao_id`.
     return { url, expiraEm: null, assinaturaRef, sessaoId: primeira.id };
+  }
+
+  async function iniciarAjusteProporcional(p: Parameters<AdaptadorDeCobranca["iniciarAjusteProporcional"]>[0]) {
+    const externalReference = `upgrade:${uuidDaOrg(p.orgId)}:${p.chaveIdempotencia}`;
+    const consulta = new URLSearchParams({ customer: p.clienteRef, externalReference, limit: "10" });
+    const existentes = ler(listaDoAsaas(cobrancaDoAsaas), await chamar("GET", `/payments?${consulta}`)).data;
+    let pagamento = existentes.find((c) => c.status === "PENDING" || c.status === "OVERDUE");
+    if (!pagamento) {
+      pagamento = ler(cobrancaDoAsaas, await chamar("POST", "/payments", {
+        customer: p.clienteRef,
+        billingType: "UNDEFINED",
+        value: p.valorCents / 100,
+        dueDate: dataCivilEmSaoPaulo(agora()),
+        description: `Ajuste proporcional — ${p.plano.nome}`,
+        externalReference,
+      }));
+    }
+    const url = linkSeguro(pagamento.invoiceUrl);
+    if (url === null) throw new ErroDoProvedor(200, "resposta_invalida", false);
+    return { pagamentoRef: pagamento.id, url };
+  }
+
+  async function lerPagamentoProporcional(pagamentoRef: string): Promise<"pendente" | "pago" | "encerrado"> {
+    const pagamento = ler(cobrancaDoAsaas, await chamar("GET", `/payments/${encodeURIComponent(pagamentoRef)}`));
+    if (PAGO.has(pagamento.status)) return "pago";
+    // Cartão em análise de risco ainda pode ser aprovado: encerrá-lo esqueceria um pagamento que vai chegar.
+    if (pagamento.status === "PENDING" || pagamento.status === "OVERDUE" || pagamento.status === "AWAITING_RISK_ANALYSIS") return "pendente";
+    return "encerrado";
   }
 
   /**
@@ -566,6 +647,7 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
     const daPrincipal = principal ? await cobrancasDaAssinatura(principal.id) : [];
     const hoje = dataCivilEmSaoPaulo(agora());
     const existe = daPrincipal.some((c) => PAGO.has(c.status));
+    const ultimaPagaDaPrincipal = daPrincipal.filter((c) => PAGO.has(c.status)).sort((a, b) => b.dueDate.localeCompare(a.dueDate))[0];
     const corrente = daPrincipal.filter((c) => c.dueDate <= hoje).at(-1);
     const devidas = daPrincipal.filter((c) => c.status === "OVERDUE");
     if (corrente !== undefined && ESTORNADO.has(corrente.status)) devidas.push(corrente);
@@ -587,6 +669,9 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
       emAtraso,
       vencidaDesde: maisAntiga === undefined ? null : fimDoDiaEmSaoPaulo(maisAntiga),
       proximoVencimento: fins.length > 0 ? new Date(Math.max(...fins)) : null,
+      periodoPagoDesde: ultimaPagaDaPrincipal
+        ? new Date(fimDoDiaEmSaoPaulo(ultimaPagaDaPrincipal.dueDate).getTime() - 24 * 60 * 60 * 1000 + 1000)
+        : null,
       jaPagou: pagas.length > 0,
       emTesteNoProvedorAte: null,
       pagamentoSemAssinaturaViva: false,
@@ -602,7 +687,7 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
   }
 
   /**
-   * Chamado no AGENDAMENTO (§7e). Guarda: cobrança OVERDUE, ou PENDING que vence
+   * Chamado após pagamento proporcional ou agendamento de downgrade (§7e). Guarda: cobrança OVERDUE, ou PENDING que vence
    * até hoje em São Paulo, é o período em uso ainda não pago — mudar o valor
    * agora mexeria no boleto que o cliente já tem. Nunca comparar com
    * `nextDueDate`: é a próxima cobrança AINDA NÃO gerada, toda cobrança
@@ -646,6 +731,8 @@ export function criarAdaptadorAsaas(dep: DependenciasDoAsaas): AdaptadorDeCobran
     removerWebhooks,
     garantirCliente,
     iniciarAssinatura,
+    iniciarAjusteProporcional,
+    lerPagamentoProporcional,
     expirarSessao,
     lerSituacao,
     trocarPlano,

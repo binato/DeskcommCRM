@@ -41,6 +41,7 @@ type Chamada = { rota: string; url: URL; headers: Headers; corpo: unknown };
 
 /** Rota = "MÉTODO /caminho" sem `/v3` e sem query. Lista = fila (a última se repete). Rota não declarada → 404. */
 function asaasFalso(rotas: Record<string, Responder>) {
+  rotas = { "PUT /payments/pay_1": { corpo: {} }, "PUT /payments/pay_v": { corpo: {} }, ...rotas };
   const filas = new Map<string, Responder>(Object.entries(rotas).map(([k, v]) => [k, Array.isArray(v) ? [...v] : v]));
   const chamadas: Chamada[] = [];
   const fetchFalso: typeof fetch = async (entrada, init) => {
@@ -373,6 +374,8 @@ describe("verificarWebhook", () => {
     // Token vazado: sem teto, cada aviso gravaria uma linha do tamanho que quem manda quiser.
     ["⭐ com id de 5 KB", JSON.stringify({ id: "x".repeat(5_000), event: "PAYMENT_RECEIVED" })],
     ["⭐ com event fora do vocabulário do Asaas", JSON.stringify({ id: "evt_1", event: "payment_received" })],
+    ["⭐ com payment.customer de 5 KB", JSON.stringify({ id: "evt_1", event: "PAYMENT_RECEIVED", payment: { customer: "x".repeat(5_000) } })],
+    ["⭐ com subscription.customer de 5 KB", JSON.stringify({ id: "evt_1", event: "SUBSCRIPTION_DELETED", subscription: { customer: "x".repeat(5_000) } })],
   ])(
     "token certo e corpo %s → ponteiro sem empresa, id curto e estável (nunca 401: o Asaas pausaria a fila)",
     (_nome, corpo) => {
@@ -639,10 +642,86 @@ describe("iniciarAssinatura", () => {
     expect(await adaptador.iniciarAssinatura(PEDIDO)).toEqual({
       url: "https://sandbox.asaas.com/i/pay_1", expiraEm: null, assinaturaRef: "sub_novo", sessaoId: "pay_1",
     });
+    expect(chamadas.find((c) => c.rota === "PUT /payments/pay_1")?.corpo).toEqual({
+      callback: { successUrl: "https://crm.example.com/cobranca/volta?para=painel&voltou=1", autoRedirect: true },
+    });
     expect(chamadas.find((c) => c.rota === "POST /subscriptions")?.corpo).toEqual({
       customer: CLIENTE, billingType: "UNDEFINED", value: 49.9, cycle: "MONTHLY", nextDueDate: "2026-10-05",
       description: "Essencial", externalReference: ORG,
+      callback: { successUrl: "https://crm.example.com/cobranca/volta?para=painel&voltou=1", autoRedirect: true },
     });
+  });
+
+  it.each([
+    "nao-e-url", "http://crm.example.com/volta", "javascript:alert(1)",
+    "https://usuario:senha@crm.example.com/volta", "https://crm.example.com/volta#fragmento",
+  ])("retorno que não serve não vai ao provedor, e a cobrança sai sem a volta automática: %s", async (urlDeVolta) => {
+    const { adaptador, chamadas } = criando();
+    expect(await adaptador.iniciarAssinatura({ ...PEDIDO, urlDeVolta })).toMatchObject({ url: "https://sandbox.asaas.com/i/pay_1" });
+    expect(chamadas.find((c) => c.rota === "POST /subscriptions")?.corpo).not.toHaveProperty("callback");
+    expect(chamadas.some((c) => c.rota.startsWith("PUT /payments"))).toBe(false);
+  });
+
+  it("conta que recusa o callback (domínio não cadastrado): refaz UMA vez sem ele e a cobrança sai", async () => {
+    const { adaptador, chamadas } = criando({
+      "POST /subscriptions": (_url, corpo) =>
+        corpo !== null && typeof corpo === "object" && "callback" in corpo
+          ? { status: 400, corpo: { errors: [{ code: "invalid_callback" }] } }
+          : { corpo: assinatura({ id: "sub_novo" }) },
+    });
+    expect(await adaptador.iniciarAssinatura(PEDIDO)).toMatchObject({ assinaturaRef: "sub_novo", url: "https://sandbox.asaas.com/i/pay_1" });
+    const posts = chamadas.filter((c) => c.rota === "POST /subscriptions");
+    expect(posts).toHaveLength(2);
+    expect(posts[1]?.corpo).not.toHaveProperty("callback");
+    // A fatura recusaria o mesmo callback: não insiste.
+    expect(chamadas.some((c) => c.rota.startsWith("PUT /payments"))).toBe(false);
+  });
+
+  it("recusa que não é do callback continua recusa (não esconde o erro de verdade)", async () => {
+    const { adaptador, chamadas } = criando({ "POST /subscriptions": { status: 400, corpo: { errors: [{ code: "invalid_customer" }] } } });
+    await expect(adaptador.iniciarAssinatura(PEDIDO)).rejects.toMatchObject({ status: 400, codigo: "invalid_customer" });
+    expect(chamadas.filter((c) => c.rota === "POST /subscriptions")).toHaveLength(2);
+  });
+
+  it("POST que caiu (5xx) não é refeito sem callback: pode ter criado", async () => {
+    const { adaptador, chamadas } = criando({ "POST /subscriptions": { status: 503 } });
+    await expect(adaptador.iniciarAssinatura(PEDIDO)).rejects.toMatchObject({ status: 503 });
+    expect(chamadas.filter((c) => c.rota === "POST /subscriptions")).toHaveLength(1);
+  });
+
+  it("falha ao pôr o callback na fatura não derruba o link válido nem cria outra assinatura", async () => {
+    const { adaptador, chamadas } = montar({
+      "GET /subscriptions": rotaDeAssinaturas([assinatura({ id: "sub_viva" })]),
+      "GET /payments": rotaDePagamentos([cobranca({ id: "pay_v", subscription: "sub_viva" })]),
+      "PUT /payments/pay_v": { status: 503 },
+    });
+    expect(await adaptador.iniciarAssinatura(PEDIDO)).toMatchObject({ assinaturaRef: "sub_viva", url: "https://sandbox.asaas.com/i/pay_v" });
+    expect(chamadas.filter((c) => c.rota.startsWith("POST "))).toHaveLength(0);
+    expect(chamadas.filter((c) => c.rota === "PUT /payments/pay_v").length).toBeGreaterThan(0);
+  });
+
+  it("⭐ cria cobrança avulsa proporcional no mesmo cliente e recupera o pagamento por referência idempotente", async () => {
+    const { adaptador, chamadas } = montar({
+      "GET /payments": rotaDePagamentos([]),
+      "POST /payments": { corpo: cobranca({ id: "pay_upgrade", invoiceUrl: "https://sandbox.asaas.com/i/pay_upgrade" }) },
+    });
+    const resultado = await adaptador.iniciarAjusteProporcional({
+      clienteRef: CLIENTE, orgId: ORG, plano: PLANO, valorCents: 3065, chaveIdempotencia: "troca-1", urlDeVolta: "https://crm.example.com/volta",
+    });
+    expect(resultado).toEqual({ pagamentoRef: "pay_upgrade", url: "https://sandbox.asaas.com/i/pay_upgrade" });
+    expect(chamadas.find((c) => c.rota === "POST /payments")?.corpo).toMatchObject({
+      customer: CLIENTE, billingType: "UNDEFINED", value: 30.65, externalReference: `upgrade:${ORG}:troca-1`,
+    });
+  });
+
+  it.each([
+    ["PENDING", "pendente"], ["OVERDUE", "pendente"],
+    // Cartão em análise de risco: ainda pode ser aprovado — encerrado esqueceria o pagamento.
+    ["AWAITING_RISK_ANALYSIS", "pendente"],
+    ["RECEIVED", "pago"], ["CONFIRMED", "pago"], ["REFUNDED", "encerrado"],
+  ])("⭐ ajuste proporcional com status %s → %s", async (status, esperado) => {
+    const { adaptador } = montar({ "GET /payments/pay_upgrade": { corpo: cobranca({ id: "pay_upgrade", status }) } });
+    await expect(adaptador.lerPagamentoProporcional("pay_upgrade")).resolves.toBe(esperado);
   });
 
   it("⭐ #2609 expirar a sessão: DELETE /payments/{id} — a cobrança some e a invoiceUrl dela para de valer", async () => {
@@ -682,6 +761,9 @@ describe("iniciarAssinatura", () => {
     expect(await adaptador.iniciarAssinatura(PEDIDO)).toMatchObject({ assinaturaRef: "sub_viva", url: "https://sandbox.asaas.com/i/pay_v" });
     expect(chamadas.some((c) => c.rota === "POST /subscriptions")).toBe(false);
     expect(chamadas[0]?.url.searchParams.get("status")).toBe("ACTIVE");
+    expect(chamadas.find((c) => c.rota === "PUT /payments/pay_v")?.corpo).toEqual({
+      callback: { successUrl: "https://crm.example.com/cobranca/volta?para=painel&voltou=1", autoRedirect: true },
+    });
   });
 
   it("cobrança ainda não gerada: transitório (o 2º clique reaproveita a assinatura)", async () => {
@@ -702,11 +784,11 @@ describe("iniciarAssinatura", () => {
     await expect(adaptador.iniciarAssinatura(PEDIDO)).rejects.toMatchObject({ codigo: "resposta_invalida" });
   });
 
-  it("a volta e a chave de idempotência não vão ao Asaas (a fatura não devolve o cliente)", async () => {
+  it("a volta segue no callback, mas a chave de idempotência não é enviada ao Asaas", async () => {
     const { adaptador, chamadas } = criando();
     await adaptador.iniciarAssinatura(PEDIDO);
     const tudo = JSON.stringify(chamadas.map((c) => [c.url.toString(), c.corpo]));
-    expect(tudo).not.toContain("cobranca/volta");
+    expect(tudo).toContain("cobranca/volta");
     expect(tudo).not.toContain("idem-1");
   });
 });
@@ -738,6 +820,7 @@ describe("lerSituacao", () => {
       assinaturaRef: "sub_1", existe: true, assinaturasVivas: 1, cancelada: false, cancelaNoFim: false,
       emAtraso: false, vencidaDesde: null, proximoVencimento: fim("2026-11-01"), jaPagou: true,
       emTesteNoProvedorAte: null, pagamentoSemAssinaturaViva: false,
+      periodoPagoDesde: new Date("2026-10-01T03:00:00.000Z"),
       linkDePagamento: "https://sandbox.asaas.com/i/pay_nov", precoCents: 4990, statusBruto: "ACTIVE",
     });
   });
@@ -965,7 +1048,7 @@ describe("cancelarNoFim e urlDeGerenciar", () => {
     expect(a.id).toBe("asaas");
     expect(Object.keys(a).sort()).toEqual(
       ["id", "testarChave", "prepararWebhook", "removerWebhooks", "clienteExiste", "verificarWebhook", "garantirCliente",
-        "iniciarAssinatura", "expirarSessao", "lerSituacao", "trocarPlano", "cancelarNoFim", "urlDeGerenciar"].sort(),
+        "iniciarAssinatura", "iniciarAjusteProporcional", "lerPagamentoProporcional", "expirarSessao", "lerSituacao", "trocarPlano", "cancelarNoFim", "urlDeGerenciar"].sort(),
     );
   });
 });

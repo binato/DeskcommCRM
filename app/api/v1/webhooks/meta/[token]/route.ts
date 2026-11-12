@@ -34,7 +34,12 @@ import { appDaMeta } from "@/lib/channels/meta/app";
 import { lerEnvelopeMeta } from "@/lib/channels/meta/envelope";
 import { parseMetaWebhook, verificationChallenge, verifyMetaSignature } from "@/lib/channels/meta/webhook";
 import { statusUpdate } from "@/lib/channels/meta/status-update";
-import { ingestMetaAppContactSync, ingestMetaEcho, ingestMetaInbound } from "@/lib/channels/meta/ingest";
+import {
+  ingestMetaAppContactSync,
+  ingestMetaEcho,
+  ingestMetaInbound,
+  ingestMetaReaction,
+} from "@/lib/channels/meta/ingest";
 import { metaSessionByWebhookToken } from "@/lib/channels/meta/session";
 import { logger } from "@/lib/logger";
 import {
@@ -155,6 +160,25 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
       continue;
     }
 
+    if (e.kind === "reaction") {
+      // Reação (#2797): linha LIGADA à mensagem alvo, e sem carimbo nenhum —
+      // o carimbo abriria a janela de 24h, moveria a ordenação da Inbox e
+      // geraria prévia/contador por um gesto que não é mensagem. Quem grava é
+      // `ingestMetaReaction`, que também trata a remoção (emoji vazio) e o
+      // descarte de reação sem alvo.
+      const r = await ingestMetaReaction(admin, e, { organizationId: session.organizationId });
+      desfechos.push(`reacao:${r.status}`);
+      if (r.status === "failed" || r.status === "no_session") {
+        logger.error("[meta.ingest] reação não ingerida", {
+          request_id: requestId,
+          status: r.status,
+          reason: r.status === "failed" ? r.reason : undefined,
+          external_id: e.externalId,
+        });
+      }
+      continue;
+    }
+
     if (e.kind === "outbound_echo") {
       // Coexistência: resposta dada pelo app WhatsApp Business. Entra na conversa
       // como saída de humano e pausa a IA — ver `ingestMetaEcho`. Mesma política
@@ -252,9 +276,20 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
       // O evento inteiro vira colunas, não só `status`: quando a Meta ACEITA o
       // template e reprova a entrega depois, o motivo só existe aqui. Ver
       // `lib/channels/meta/status-update.ts`.
+      //
+      // O `delivered_at` como está no banco é lido ANTES: a hora da entrega é
+      // de uma vez só e o `read` chega depois do `delivered` — sem olhar a
+      // linha, ele reescrevia o instante em que a mensagem tocou o aparelho
+      // (#4316). Mesma guarda do `carimbarUmaVez` do canal não-oficial.
+      const { data: carimbos } = await admin
+        .from("messages")
+        .select("delivered_at")
+        .eq("organization_id", session.organizationId)
+        .eq("external_id", e.externalId)
+        .maybeSingle();
       await admin
         .from("messages")
-        .update(statusUpdate(e, now))
+        .update(statusUpdate(e, now, carimbos ?? {}))
         .eq("organization_id", session.organizationId)
         .eq("external_id", e.externalId);
     }
