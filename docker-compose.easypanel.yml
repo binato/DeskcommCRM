@@ -9,15 +9,47 @@
 # 2. Sem diretivas "ports:" publicando no host: evita qualquer conflito de portas.
 # 3. Sem "container_name:" fixo: permite escopo automático do Easypanel.
 # 4. Volumes nomeados dedicados para persistir sessões do WhatsApp (waha-data).
-# 5. Comunicação interna direta via rede do Easypanel.
+# 5. Comunicação interna direta via rede do Easypanel (bragentes_supabase_default).
+# 6. Auto-migração via db-migrator: aplica extensões e baseline.sql antes de iniciar o app.
 # ==============================================================================
 
 services:
+  db-migrator:
+    image: postgres:17-alpine
+    restart: "no"
+    networks:
+      - default
+      - supabase_net
+    volumes:
+      - ./:/workspace:ro
+    environment:
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "=== DB-MIGRATOR: Aguardando PostgreSQL em $$SUPABASE_DB_URL ==="
+        until pg_isready -d "$$SUPABASE_DB_URL"; do
+          echo "Aguardando banco de dados responder..."
+          sleep 2
+        done
+        echo "=== DB-MIGRATOR: PostgreSQL conectado! Habilitando extensões ==="
+        psql "$$SUPABASE_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;"
+        psql "$$SUPABASE_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public;"
+        psql "$$SUPABASE_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;"
+        psql "$$SUPABASE_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\" WITH SCHEMA public;"
+        psql "$$SUPABASE_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;"
+        echo "=== DB-MIGRATOR: Extensões prontas. Aplicando baseline.sql ==="
+        psql "$$SUPABASE_DB_URL" -v ON_ERROR_STOP=0 -f /workspace/supabase/baseline.sql
+        echo "=== DB-MIGRATOR: Concluído com sucesso! ==="
+
   app:
     image: ${APP_IMAGE:-ghcr.io/melgarafael/deskcommcrm:stable}
     pull_policy: ${APP_PULL_POLICY:-always}
     restart: unless-stopped
     env_file: .env
+    networks:
+      - default
+      - supabase_net
     environment:
       PORT: "3000"
       EVENT_LOG_WORKER_DRAINS: "true"
@@ -25,6 +57,8 @@ services:
       UPSTASH_REDIS_REST_URL: "http://srh:80"
       UPSTASH_REDIS_REST_TOKEN: ${SRH_TOKEN}
     depends_on:
+      db-migrator:
+        condition: service_completed_successfully
       srh:
         condition: service_started
       waha:
@@ -41,6 +75,9 @@ services:
     pull_policy: ${WORKER_PULL_POLICY:-always}
     restart: unless-stopped
     env_file: .env
+    networks:
+      - default
+      - supabase_net
     environment:
       WAHA_API_BASE_URL: "http://waha:3000"
       UPSTASH_REDIS_REST_URL: "http://srh:80"
@@ -59,6 +96,8 @@ services:
   waha:
     image: ${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}
     restart: unless-stopped
+    networks:
+      - default
     environment:
       WAHA_API_KEY: "sha512:${WAHA_API_KEY_SHA512}"
       WHATSAPP_HOOK_URL: "http://app:3000/api/v1/webhooks/waha"
@@ -74,6 +113,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    networks:
+      - default
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -84,6 +125,8 @@ services:
   srh:
     image: hiett/serverless-redis-http@sha256:5b0bb9239fce53abf87b2018a7a0deb9ec7bd900c5360738fe5fbeeb426f9150
     restart: unless-stopped
+    networks:
+      - default
     environment:
       SRH_MODE: "env"
       SRH_TOKEN: "${SRH_TOKEN}"
@@ -96,6 +139,8 @@ services:
     image: ${SCHEDULER_IMAGE:-ghcr.io/melgarafael/deskcomm-scheduler:stable}
     pull_policy: ${SCHEDULER_PULL_POLICY:-always}
     restart: unless-stopped
+    networks:
+      - default
     depends_on:
       app:
         condition: service_healthy
@@ -106,3 +151,9 @@ services:
 volumes:
   waha-data:
   waha-media:
+
+networks:
+  default:
+  supabase_net:
+    name: bragentes_supabase_default
+    external: true
