@@ -94,7 +94,7 @@ services:
     stop_grace_period: 40s
 
   waha:
-    image: ${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}
+    image: ${WAHA_IMAGE:-devlikeapro/waha:noweb-arm-2026.7.2}
     restart: unless-stopped
     networks:
       - default
